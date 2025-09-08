@@ -1,0 +1,293 @@
+---
+title: "CAS Group 24"
+format: docx
+editor: visual
+---
+
+## Dataset Import and Cleaning
+
+```{r}
+#| warning: false
+library(readxl)
+library(dplyr)
+
+dataset <- read_excel("dataset.xlsx", sheet = 1)
+
+str(dataset)
+# Change all the "chr" to factor
+
+dataset <- dataset %>%
+  mutate(
+    across(
+      where(is.character), function(col) {
+      factor(col, levels = unique(col))
+      }
+    )
+  )
+
+str(dataset)
+
+```
+
+## Count Models (Poisson and Negative Binomial)
+
+### Train and Test dataset split
+
+```{r}
+#| warning: false
+library(caret)
+
+# We use createDataPartition rather than sample[] is because createDataPartition keeps the distribution of the response variable. 
+# From the example above we see approximate 5% of the response have 1 claim so the test set will also have approximate 5% of claim size of 1.
+# This train dataset will consist of 70% of the data from the full dataset
+set.seed(716)
+
+train_index <- createDataPartition(dataset$ClaimNb,p = 0.7,list = FALSE)
+
+data_train <- dataset[train_index,]
+
+data_test <- dataset[-train_index,]
+
+# Construct Dataset for counting model comparison
+count_cols <- c("Power", "CarAge", "DriverAge", "Brand", "Gas", "Region", "Density", "ClaimNb")
+
+claim_number_train_set <- data_train[,count_cols]
+claim_number_test_set <- data_test[,count_cols]
+
+names(claim_number_train_set)
+names(claim_number_test_set)
+
+```
+
+### Poisson GLM model
+
+```{r}
+poisson_model <- glm(ClaimNb ~., data = claim_number_train_set, family = poisson(link = "log"))
+
+summary(poisson_model)
+
+```
+
+### Negative Binomial GLM model
+
+```{r}
+#| warning: false
+library(MASS)
+
+negative_binomial_model <- glm.nb(ClaimNb ~., data = claim_number_train_set)
+# This code automatically estimate the overdispersion parameter theta
+
+summary(negative_binomial_model)
+
+```
+
+### Model Evaluation
+
+```{r}
+#| warning: false
+library(pscl)
+
+vuong(poisson_model,negative_binomial_model)
+# This function allows us to compare between 2 models
+# From the output dataframe we can see that Negative Binomial Model is better than Poisson Model (Alternative Hypothesis is accepted since p-value are very small) in terms of Vuong Test Statistics, Akaike and Bayesian Information Criterion.
+
+# This can be explained by the overdispersion observed previously
+
+```
+
+### Multicollinearity Check
+
+#### 1. Correlation Matrix (Examine ~n~C~2~ pairs of regressors)
+
+```{r}
+#| warning: false
+library(corrplot)
+# Multicollinearity issue in the dataset can cause poor regression coefficients estimates
+# Dummy coding since we have factors in the dataset, we can express them with numbers
+claim_number_train_set_mm <- model.matrix(ClaimNb ~. -1, data = claim_number_train_set)
+# Drop the Intercept
+
+claim_number_train_set_mm <- as.data.frame(claim_number_train_set_mm)
+
+claim_number_train_cor_mat <- cor(claim_number_train_set_mm)
+
+# Make the correlation matrix have column and row names that is the first to 10th character of the original name
+colnames(claim_number_train_cor_mat) <- substr(colnames(claim_number_train_cor_mat),1,10)
+
+rownames(claim_number_train_cor_mat) <- substr(rownames(claim_number_train_cor_mat),1,10)
+
+
+corrplot(claim_number_train_cor_mat, method = "color")
+
+# Output the name of highly-correlated pair
+corr_detect <- which(abs(claim_number_train_cor_mat) > 0.5 & abs(claim_number_train_cor_mat) < 1, arr.ind = TRUE)
+# Return array with row number
+
+apply(corr_detect,MARGIN = 1,function(corr_pair){
+  i <- corr_pair[1]
+  j <- corr_pair[2]
+  rowname <- colnames(claim_number_train_set_mm)
+  colname <- colnames(claim_number_train_set_mm)
+  
+  cat(paste(rowname[i],"and",colname[j],"having Correlation Coefficient of",round(claim_number_train_cor_mat[i,j],3)),"\n")
+})
+
+```
+
+#### 2. Variance Inflation Factor
+
+```{r}
+#| warning: false
+library(car)
+
+# GVIF is the Generalized VIF
+# It is used when a model includes categorical variables with more than 2 levels.
+GVIF_summary <- data.frame(
+  VIF_Poisson_model = vif(poisson_model),
+  VIF_NBinomial_model = vif(negative_binomial_model)
+)
+
+colnames(GVIF_summary) <- c("GVIF_Poisson","df_Poisson","Scaled_Poisson_GVIF","GVIF_Nbinomial","df_NBinomial","Scaled_NBinomial_GVIF")
+
+GVIF_summary
+
+# Scaled GVIF is calculated through GVIF^(1/2df)
+# < 2: good
+# 2–5: moderate concern
+# > 5: problematic
+```
+
+```{r}
+#| warning: false
+library(olsrr)
+
+# Using the OLSRR package to get classic VIF for each individual variable (including dummy variables).
+vif_count_poisson <- ols_coll_diag(poisson_model)
+# ols_coll_diag will automatically access the model matrix (the matrix with dummy variable) to calculate the classic VIF
+vif_count_nbinomial <- ols_coll_diag(negative_binomial_model)
+
+vif_count_poisson <- vif_count_poisson$vif_t[,c("Variables","VIF")]
+vif_count_nbinomial <- vif_count_nbinomial$vif_t[,c("Variables","VIF")]
+
+colnames(vif_count_poisson) <- c("Variables", "VIF_Poisson")
+colnames(vif_count_nbinomial) <- c("Variables", "VIF_Negative_Binomial")
+
+
+VIF_summary <- merge(vif_count_poisson,vif_count_nbinomial,by = "Variables")
+  
+VIF_summary
+
+```
+
+```{r}
+#| warning: false
+library(mctest)
+
+mctest(poisson_model)
+
+mctest(negative_binomial_model)
+
+```
+
+## Zero-Inflated Models
+
+### Dataset Preprocessing
+
+```{r}
+claim_number_train_scaled <- claim_number_train_set
+claim_number_test_scaled <- claim_number_test_set
+
+# For these numerical variables, we change them into standardized data
+claim_number_train_scaled[,c("CarAge","DriverAge","Density")] <- scale(claim_number_train_scaled[,c("CarAge","DriverAge","Density")])
+
+claim_number_test_scaled[,c("CarAge","DriverAge","Density")] <- scale(claim_number_test_scaled[,c("CarAge","DriverAge","Density")])
+
+head(claim_number_train_scaled)
+
+```
+
+### Zero-Inflated Model
+
+```{r}
+#| warning: false
+# We seperate the modelling process into 2 part A|B:
+# The count component (A) models the number of claims (including the possibility of 0)  using a Negative Binomial distribution to allow for overdispersion.
+# The zero-inflation component (B) models the probability that an observation is a guaranteed zero not due to the count process.
+zero_nbinomial_model <- zeroinfl(ClaimNb ~. | 1 + CarAge, 
+                                 data = claim_number_train_scaled,
+                                 dist = "negbin")
+
+
+summary(zero_nbinomial_model)
+
+```
+
+![](images/clipboard-4209070056.png)
+
+### Hurdle Model
+
+```{r}
+#| warning: false
+# Hurdle Model does similar thing as the Zero-Inflated Model but the count part models positive count only (claim number of at least 1)
+hurdle_model <- hurdle(ClaimNb ~.|., data = claim_number_train_scaled, dist = "negbin")
+
+summary(hurdle_model)
+
+```
+
+![](images/clipboard-3071046178.png)
+
+### Tweedie Model (Compound Poisson-Gamma)
+
+```{r}
+#| warning: false
+library(statmod)
+
+tweedie_model <- glm(ClaimNb ~., data = claim_number_train_scaled,
+                    family = tweedie(var.power = 1.5, link.power = 0))
+
+summary(tweedie_model)
+
+```
+
+## Validation with RSME
+
+So far we have built:
+
+1.  Poisson GLM
+2.  Negative Binomial GLM
+3.  Zero-Inflated Model
+4.  Hurdle Model
+5.  Tweedie Model
+
+```{r}
+#| warning: false
+library(Metrics)
+# We use all of the model above to predict E[y|x] which is the expected no of claims using the test dataset
+poisson_test <- predict(poisson_model, newdata = claim_number_test_set, type = "response")
+nbinomial_test <- predict(negative_binomial_model, newdata = claim_number_test_set,
+                          type = "response")
+zero_test <- predict(zero_nbinomial_model, newdata = claim_number_test_scaled,
+                     type = "response")
+hurdle_test <- predict(hurdle_model, newdata = claim_number_test_scaled,
+                       type = "response")
+tweedie_test <- predict(tweedie_model, newdata = claim_number_test_scaled,
+                        type = "response")
+
+# Calculate Root Mean Squared Error
+poisson_test_rmse   <- rmse(claim_number_test_set$ClaimNb, poisson_test)
+nbinomial_test_rmse <- rmse(claim_number_test_set$ClaimNb, nbinomial_test)
+zero_test_rmse      <- rmse(claim_number_test_scaled$ClaimNb, zero_test)
+hurdle_test_rmse    <- rmse(claim_number_test_scaled$ClaimNb, hurdle_test)
+tweedie_test_rmse   <- rmse(claim_number_test_scaled$ClaimNb, tweedie_test)
+
+# Create summary data frame
+rmse_results <- data.frame(
+  Model = c("Poisson", "Negative Binomial", "Zero-Inflated", "Hurdle", "Tweedie"),
+  RMSE  = c(poisson_test_rmse, nbinomial_test_rmse, zero_test_rmse, hurdle_test_rmse, tweedie_test_rmse)
+)
+
+print(rmse_results)
+
+
+```

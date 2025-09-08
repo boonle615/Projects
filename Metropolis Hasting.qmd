@@ -1,0 +1,677 @@
+---
+title: "Election"
+format: docx
+editor: visual
+---
+
+## 1. Load Packages
+
+```{r}
+#| message: false
+#| warning: false
+library(readr)
+library(ggplot2)
+library(gridExtra) # For multiple plots
+library(dplyr)
+library(tidyr)
+
+```
+
+## 2. Read the dataset
+
+```{r}
+set.seed(1117)
+
+election_data <- read.csv("census_parlimen.csv")
+
+# N is the number of voters
+# Y is the number of voters who support the government
+# Notable Score is where that seat is contested by a famous politician
+election_data$seat <- as.integer(election_data$seat)
+election_data$region <- as.factor(election_data$region)
+election_data$N <- as.integer(election_data$N)
+election_data$Y <- as.integer(election_data$Y)
+election_data$malay_prop <- as.numeric(election_data$malay_prop)
+election_data$indian_prop <- as.numeric(election_data$indian_prop)
+election_data$chinese_prop <- as.numeric(election_data$chinese_prop)
+election_data$notable_score <- as.integer(election_data$notable_score)
+
+# Extract number of seats and regions
+C <- nrow(election_data)
+R <- length(unique(election_data$region))
+
+print(C)
+print(R)
+
+head(election_data)
+
+```
+
+## 3. Define Logistic Regression Log-Posterior
+
+Assuming all priors and hyperpriors are normally distributed:
+
+$$
+p(\eta \mid y) \propto p(y \mid \eta = \beta_0, \beta_{Ethnic,Region},\beta_{Notable}) \cdot p(\beta_{Ethnic,Region} \mid \mu_{Ethnic},\tau_{Ethnic}) \cdot p(\mu_{Ethnic}) \\ \cdot p(\beta_0) \cdot p(\beta_{Notable})
+\cdot p(\tau_{Ethnic})
+\\
+\ln p(\eta \mid y) \propto \ln p(y \mid \eta = \beta_0, \beta_{Ethnic,Region},\beta_{Notable}) + \ln p(\beta_{Ethnic,Region} \mid \mu_{Ethnic},\tau_{Ethnic}) \\ + \ln p(\mu_{Ethnic}) + \ln p(\beta_0) + \ln p(\beta_{Notable}) +
+\ln p(\tau_{Ethnic})
+$$
+
+The model distribution (Logistic Regression with Logit Link):
+
+$$
+f_i = p_i^{Y_i} \cdot (1-p_i)^{N_i - Y_i} \\
+\ell_i = Y_i \cdot ln(p_i) + (N_i - Y_i) \cdot ln(1 - p_i) \\
+\ell_i =Y_i \cdot \ln\!\left(\frac{e^{\eta_i}}{1 + e^{\eta_i}}\right) + 
+(N_i - Y_i) \cdot \ln\!\left(\frac{1}{1 + e^{\eta_i}}\right) \\
+\ell_i = 
+Y_i \cdot \left[-\ln\!\left(1 + e^{-\eta_i}\right)\right] +
+\left(N_i - Y_i\right) \cdot \left[-\ln\!\left(1 + e^{\eta_i}\right)\right]
+$$
+
+The log-prior for intercept and beta_notable (Normally distributed with mean 0 and standard deviation 2):
+
+$$
+p(\beta) = \frac{1}{\sqrt{2\pi\sigma^2}}  \exp\!\left(-\frac{(\beta-\mu)^2}{2\sigma^2}\right) \\
+\text{Zero mean and dropping multiplicative constant}(\mu=0): \\
+p(\beta) = \exp\!\left(-\frac{\beta^2}{2\sigma^2}\right) \\
+\ln p(\beta) = - \!\left(\frac{\beta^2}{2\sigma^2}\right) \\
+$$The log-prior for region and ethnic-specific slope:
+
+$$
+p(\beta_{Ethnic,Region_i}) = \frac{1}{\sqrt{2\pi\sigma^2}} 
+\exp\!\left(-\frac{(\beta_{Ethnic,Region_i}-\mu_{Ethnic})^2}{2\tau_{Ethnic}^2}\right) \\
+\ln p(\beta_{Ethnic,Region_i}) = - \!\left(\frac{(\beta_{Ethnic,Region_i} 
+- \mu_{Ethnic})^2}{2\tau_{Ethnic}^2}\right) \\
+$$The hyperprior of mu ethnic is normal distribution with mean 0 and standard deviation of 5:
+
+$$
+\ln p(\mu_{Ethnic}) = - \!\left(\frac{\mu_{ethnic}^2}{2\sigma^2}\right) \\
+$$
+
+The hyperprior of tau follows a half-cauchy distribution with scale parameter 2:
+
+$$
+f(\tau_{Ethnic} \mid \sigma) = \frac{2}{\pi \, \sigma \, \left(1 + \left(\frac{\tau_{Ethnic}}{\sigma}\right)^2\right)}, 
+\quad \tau \ge 0
+$$
+
+```{r}
+log_posterior_hier <- function(beta0, beta_notable,
+                               beta_malay_r, beta_indian_r, beta_chinese_r,
+                               mu_malay, mu_indian, mu_chinese, election_data,
+                               prior_sd_beta0 = 2,
+                               prior_sd_notable = 2,
+                               scale, tau_malay, tau_indian, tau_chinese,
+                               prior_sd_mu = 5) {
+  
+  # The number of voters, the number of supporters of the BN goverment and           ethnicity proportion of 222 constituencies
+  N_vec      <- election_data$N
+  Y_vec      <- election_data$Y
+  x_malay    <- election_data$malay_prop
+  x_indian   <- election_data$indian_prop
+  x_chinese  <- election_data$chinese_prop
+  x_notable  <- election_data$notable_score
+  region_id  <- as.integer(election_data$region)
+  
+  # 1) Log-likelihood of the model distribution 
+  # eta is the systematic component
+  eta <- numeric(length(Y_vec))
+  for (i in seq_along((Y_vec))) {
+    r <- region_id[i]
+    eta[i] <- beta0 + beta_notable * x_notable[i] +
+              beta_malay_r[r]   * x_malay[i] +
+              beta_indian_r[r]  * x_indian[i] +
+              beta_chinese_r[r] * x_chinese[i]
+  }
+  
+  # Individual Log-likelihood function for a single data point
+  # log1p(x) = ln(1+x)
+  loglik_i <- Y_vec * (-log1p(exp(-eta))) +
+              (N_vec - Y_vec) * (-log1p(exp(eta)))
+  
+  # All data points
+  loglik   <- sum(loglik_i)
+  
+  # 2) Priors on β0 and β_notable
+  logprior_beta0      <- - (beta0^2) / (2 * prior_sd_beta0^2)
+  logprior_notable    <- - (beta_notable^2) / (2 * prior_sd_notable^2)
+  
+  # 3) Priors on region-specific slopes
+  logprior_malay_r   <- - sum((beta_malay_r   - mu_malay)^2)   / (2 * tau_malay^2)
+  logprior_indian_r  <- - sum((beta_indian_r  - mu_indian)^2)  / (2 * tau_indian^2)
+  logprior_chinese_r <- - sum((beta_chinese_r - mu_chinese)^2) / 
+                        (2 * tau_chinese^2)
+  
+  # 4) Hyperprior of prior mean
+  logprior_mu_malay   <- - (mu_malay^2)   / (2 * prior_sd_mu^2)
+  logprior_mu_indian  <- - (mu_indian^2)  / (2 * prior_sd_mu^2)
+  logprior_mu_chinese <- - (mu_chinese^2) / (2 * prior_sd_mu^2)
+  
+  # 5) Hyperprior of tau_ethnic
+  if (tau_malay <= 0) {
+    logprior_tau_malay <- -Inf
+  } else {
+    logprior_tau_malay <- log(2) - log(pi * scale * (1 + (tau_malay/scale)^2))
+  }
+  
+  if (tau_indian <= 0) {
+    logprior_tau_indian <- -Inf
+  } else {
+    logprior_tau_indian <- log(2) - log(pi * scale * (1 + (tau_indian/scale)^2))
+  }
+  
+  if (tau_chinese <= 0) {
+    logprior_tau_chinese <- -Inf
+  } else {
+    logprior_tau_chinese <- log(2) - log(pi * scale * (1 + (tau_chinese/scale)^2))
+  }
+  
+  # Combine all components
+  return(loglik +
+         logprior_beta0 + logprior_notable +
+         logprior_malay_r + logprior_indian_r + logprior_chinese_r +
+         logprior_mu_malay + logprior_mu_indian + logprior_mu_chinese +
+         logprior_tau_malay + logprior_tau_indian + logprior_tau_chinese)
+}
+
+```
+
+## 4. Metropolis-Hasting Algorithm
+
+We will use Normal Distribution as the proposal distribution.
+
+```{r}
+set.seed(1)
+
+n_iter          <- 2500
+burn_in         <- 1500
+prior_sd_beta0  <- 2
+prior_sd_notable<- 2
+prior_sd_mu     <- 5
+scale           <- 2
+
+# This will determine the strength of random jump
+sigma_beta0     <- 0.01
+sigma_mu        <- 0.30
+sigma_region    <- 0.01
+sigma_tau       <- 0.30
+
+R <- length(unique(election_data$region))
+chain <- matrix(0, nrow = n_iter, ncol = 2 + 3*R + 3 + 3)
+colnames(chain) <- c(
+  "beta0", "beta_notable",
+  paste0("beta_malay_r",   1:R),
+  paste0("beta_indian_r",  1:R),
+  paste0("beta_chinese_r", 1:R),
+  "mu_malay", "mu_indian", "mu_chinese",
+  "tau_malay", "tau_indian", "tau_chinese"
+)
+
+# Initial Starting Values
+chain[1, ] <- c(0, 0, rep(0, 3*R), 0, 0, 0, 1, 1 ,1)
+
+# Calculate log-likelihood at initial point, we will update this after new parameter are accepted
+initial_beta0        <- chain[1, "beta0"]
+initial_beta_notable <- chain[1, "beta_notable"]
+initial_beta_malay_r   <- chain[1, paste0("beta_malay_r",   1:R)]
+initial_beta_indian_r  <- chain[1, paste0("beta_indian_r",  1:R)]
+initial_beta_chinese_r <- chain[1, paste0("beta_chinese_r", 1:R)]
+initial_mu_malay     <- chain[1, "mu_malay"]
+initial_mu_indian    <- chain[1, "mu_indian"]
+initial_mu_chinese   <- chain[1, "mu_chinese"]
+initial_tau_malay    <- chain[1, "tau_malay"]
+initial_tau_chinese   <- chain[1, "tau_chinese"]
+initial_tau_indian   <- chain[1, "tau_indian"]
+
+logpost_curr <- log_posterior_hier(
+  beta0        = initial_beta0,
+  beta_notable = initial_beta_notable,
+  beta_malay_r   = initial_beta_malay_r,
+  beta_indian_r  = initial_beta_indian_r,
+  beta_chinese_r = initial_beta_chinese_r,
+  mu_malay     = initial_mu_malay,
+  mu_indian    = initial_mu_indian,
+  mu_chinese   = initial_mu_chinese,
+  election_data    = election_data,
+  prior_sd_beta0   = prior_sd_beta0,
+  prior_sd_notable = prior_sd_notable,
+  scale            = scale,
+  tau_malay        = initial_tau_malay,
+  tau_chinese      = initial_tau_chinese,
+  tau_indian       = initial_tau_indian,
+  prior_sd_mu      = prior_sd_mu
+)
+
+# Track Acceptance
+move_beta0   <- logical(n_iter)      # for block 1
+move_region  <- array(FALSE, dim = c(n_iter, 3, R))  # for block 2
+move_mu      <- logical(n_iter)      # for block 3
+move_tau      <- logical(n_iter)     # for block 4
+
+# Main Loop
+for (t in 2:n_iter) {
+  # Block 1: Update Beta 0 and Beta Notable
+  # The original value + The random jump
+  prev_beta0        <- chain[t - 1, "beta0"]
+  prev_beta_notable <- chain[t - 1, "beta_notable"]
+  prop2 <- c(prev_beta0, prev_beta_notable) + rnorm(2, mean = 0, sd = sigma_beta0)
+  prop_beta0        <- prop2[1]
+  prop_beta_notable <- prop2[2]
+  
+  prev_beta_malay_r   <- as.numeric(chain[t - 1, paste0("beta_malay_r",   1:R)])
+  prev_beta_indian_r  <- as.numeric(chain[t - 1, paste0("beta_indian_r",  1:R)])
+  prev_beta_chinese_r <- as.numeric(chain[t - 1, paste0("beta_chinese_r", 1:R)])
+  prev_mu_malay     <- chain[t - 1, "mu_malay"]
+  prev_mu_indian    <- chain[t - 1, "mu_indian"]
+  prev_mu_chinese   <- chain[t - 1, "mu_chinese"]
+  prev_tau_malay     <- chain[t - 1, "tau_malay"]
+  prev_tau_indian    <- chain[t - 1, "tau_indian"]
+  prev_tau_chinese   <- chain[t - 1, "tau_chinese"]
+
+  logpost_prop_1 <- log_posterior_hier(
+    beta0        = prop_beta0,
+    beta_notable = prop_beta_notable,
+    beta_malay_r   = prev_beta_malay_r,
+    beta_indian_r  = prev_beta_indian_r,
+    beta_chinese_r = prev_beta_chinese_r,
+    mu_malay     = prev_mu_malay,
+    mu_indian    = prev_mu_indian,
+    mu_chinese   = prev_mu_chinese,
+    election_data    = election_data,
+    prior_sd_beta0   = prior_sd_beta0,
+    prior_sd_notable = prior_sd_notable,
+    scale            = scale,
+    tau_malay        = prev_tau_malay,
+    tau_chinese      = prev_tau_chinese,
+    tau_indian       = prev_tau_indian,
+    prior_sd_mu      = prior_sd_mu
+  )
+  
+  # The core of this algorithm is that if the improvement in log-likelihood under the new parameter settings then the higher the chance we accept it
+  log_r1 <- logpost_prop_1 - logpost_curr
+  if (log(runif(1)) < log_r1) {
+    # Write in the new values
+    chain[t, "beta0"]        <- prop_beta0
+    chain[t, "beta_notable"] <- prop_beta_notable
+    
+    # If the new setting is adopted, the value of the log-likelihood function has to be updated
+    logpost_curr             <- logpost_prop_1
+    # Record
+    move_beta0[t]            <- TRUE
+  } else {
+    chain[t, "beta0"]        <- prev_beta0
+    chain[t, "beta_notable"] <- prev_beta_notable
+    move_beta0[t]            <- FALSE
+  }
+  
+  new_beta0 <- chain[t, "beta0"]
+  new_beta_notable <- chain[t, "beta_notable"]
+  
+  
+  # Block 2: Update each region specific slope:
+  # We will use for loop to update the slope of each region for each ethnicity
+  # 2A) Slope of Malay of each region:
+  for (r in 1:R) {
+    bmr_old <- prev_beta_malay_r[r]
+    bmr_prop <- bmr_old + rnorm(1, mean = 0, sd = sigma_region)
+    
+    # We have I regions, we kept other I - 1 the same except for the one under the loop
+    prop_beta_malay_r <- prev_beta_malay_r
+    prop_beta_malay_r[r] <- bmr_prop
+    
+    # Shall use the latest updated parameter (Intercept and beta_notable)
+    logpost_prop_2a <- log_posterior_hier(
+      beta0        = new_beta0,
+      beta_notable = new_beta_notable,
+      beta_malay_r   = prop_beta_malay_r,
+      beta_indian_r  = prev_beta_indian_r,
+      beta_chinese_r = prev_beta_chinese_r,
+      mu_malay     = prev_mu_malay,
+      mu_indian    = prev_mu_indian,
+      mu_chinese   = prev_mu_chinese,
+      election_data    = election_data,
+      prior_sd_beta0   = prior_sd_beta0,
+      prior_sd_notable = prior_sd_notable,
+      scale            = scale,
+      tau_malay        = prev_tau_malay,
+      tau_chinese      = prev_tau_chinese,
+      tau_indian       = prev_tau_indian,
+      prior_sd_mu      = prior_sd_mu
+    )
+    
+    log_r2a <- logpost_prop_2a - logpost_curr
+    if (log(runif(1)) < log_r2a) {
+      chain[t, paste0("beta_malay_r", r)] <- bmr_prop
+      logpost_curr <- logpost_prop_2a
+      move_region[t, 1, r] <- TRUE
+    } else {
+      chain[t, paste0("beta_malay_r", r)] <- bmr_old
+      move_region[t, 1, r] <- FALSE
+    }
+  }
+  
+  new_beta_malay_r  <- as.numeric(chain[t, paste0("beta_malay_r", 1:R)]) 
+  
+  # 2B) Slope of Indian of each region
+  for (r in 1:R){
+    bir_old <- prev_beta_indian_r[r]
+    bir_prop <- bir_old + rnorm(1, mean = 0, sd = sigma_region)
+    prop_beta_indian_r <- prev_beta_indian_r
+    prop_beta_indian_r[r] <- bir_prop
+    
+    logpost_prop_2b <- log_posterior_hier(
+      beta0        = new_beta0,
+      beta_notable = new_beta_notable,
+      beta_malay_r   = new_beta_malay_r,
+      beta_indian_r  = prop_beta_indian_r,
+      beta_chinese_r = prev_beta_chinese_r,
+      mu_malay     = prev_mu_malay,
+      mu_indian    = prev_mu_indian,
+      mu_chinese   = prev_mu_chinese,
+      election_data    = election_data,
+      prior_sd_beta0   = prior_sd_beta0,
+      prior_sd_notable = prior_sd_notable,
+      scale            = scale,
+      tau_malay        = prev_tau_malay,
+      tau_chinese      = prev_tau_chinese,
+      tau_indian       = prev_tau_indian,
+      prior_sd_mu      = prior_sd_mu
+    )
+    
+    log_r2b <- logpost_prop_2b - logpost_curr
+    if (log(runif(1)) < log_r2b) {
+      chain[t, paste0("beta_indian_r", r)] <- bir_prop
+      logpost_curr <- logpost_prop_2b
+      move_region[t, 2, r] <- TRUE
+    } else {
+      chain[t, paste0("beta_indian_r", r)] <- bir_old
+      move_region[t, 2, r] <- FALSE
+    }
+  }
+  
+  new_beta_indian_r  <- as.numeric(chain[t, paste0("beta_indian_r", 1:R)]) 
+  
+  # 2C) Update the slope of chinese in each region
+  for (r in 1:R) {
+    bcr_old <- prev_beta_chinese_r[r]
+    bcr_prop <- bcr_old + rnorm(1, mean = 0, sd = sigma_region)
+    prop_beta_chinese_r <- prev_beta_chinese_r
+    prop_beta_chinese_r[r] <- bcr_prop
+    
+    logpost_prop_2c <- log_posterior_hier(
+      beta0        = new_beta0,
+      beta_notable = new_beta_notable,
+      beta_malay_r   = new_beta_malay_r,
+      beta_indian_r  = new_beta_indian_r,
+      beta_chinese_r = prop_beta_chinese_r,
+      mu_malay     = prev_mu_malay,
+      mu_indian    = prev_mu_indian,
+      mu_chinese   = prev_mu_chinese,
+      election_data    = election_data,
+      prior_sd_beta0   = prior_sd_beta0,
+      prior_sd_notable = prior_sd_notable,
+      scale            = scale,
+      tau_malay        = prev_tau_malay,
+      tau_chinese      = prev_tau_chinese,
+      tau_indian       = prev_tau_indian,
+      prior_sd_mu      = prior_sd_mu
+    )
+    
+    log_r2c <- logpost_prop_2c - logpost_curr
+    if (log(runif(1)) < log_r2c) {
+      chain[t, paste0("beta_chinese_r", r)] <- bcr_prop
+      logpost_curr <- logpost_prop_2c
+      move_region[t, 3, r] <- TRUE
+    } else {
+      chain[t, paste0("beta_chinese_r", r)] <- bcr_old
+      move_region[t, 3, r] <- FALSE
+    }
+  }
+  
+  new_beta_chinese_r  <- as.numeric(chain[t, paste0("beta_chinese_r", 1:R)])
+  
+  
+  # Block 3: We will update the hypermean mu for each ethnic
+  prev_mu <- c(prev_mu_malay, prev_mu_indian, prev_mu_chinese)
+  prop3  <- prev_mu + rnorm(3, mean = 0, sd = sigma_mu)
+  prop_mu_malay   <- prop3[1]
+  prop_mu_indian  <- prop3[2]
+  prop_mu_chinese <- prop3[3]
+  
+  logpost_prop_3 <- log_posterior_hier(
+      beta0        = new_beta0,
+      beta_notable = new_beta_notable,
+      beta_malay_r   = new_beta_malay_r,
+      beta_indian_r  = new_beta_indian_r,
+      beta_chinese_r = new_beta_chinese_r,
+      mu_malay     = prop_mu_malay,
+      mu_indian    = prop_mu_indian,
+      mu_chinese   = prop_mu_chinese,
+      election_data    = election_data,
+      prior_sd_beta0   = prior_sd_beta0,
+      prior_sd_notable = prior_sd_notable,
+      scale            = scale,
+      tau_malay        = prev_tau_malay,
+      tau_chinese      = prev_tau_chinese,
+      tau_indian       = prev_tau_indian,
+      prior_sd_mu      = prior_sd_mu
+  )
+  
+  log_r3 <- logpost_prop_3 - logpost_curr
+  if (log(runif(1)) < log_r3) {
+    chain[t, "mu_malay"]   <- prop_mu_malay
+    chain[t, "mu_indian"]  <- prop_mu_indian
+    chain[t, "mu_chinese"] <- prop_mu_chinese
+    logpost_curr           <- logpost_prop_3
+    move_mu[t]             <- TRUE
+  } else {
+    chain[t, c("mu_malay", "mu_indian", "mu_chinese")] <- prev_mu
+    move_mu[t] <- FALSE
+  }
+  
+  new_mu_malay <- chain[t, "mu_malay"]
+  new_mu_indian <- chain[t, "mu_indian"]
+  new_mu_chinese <- chain[t, "mu_chinese"]
+  
+  # Block 4: Update tau_ethnic
+  # The support of the distribution have to be >0
+  prev_tau <- c(prev_tau_malay, prev_tau_indian, prev_tau_chinese)
+  repeat {
+    prop_tau_malay <- rnorm(1, mean = prev_tau_malay, sd = sigma_tau)
+    if (prop_tau_malay > 0) break
+  }
+  
+  repeat {
+    prop_tau_chinese <- rnorm(1, mean = prev_tau_chinese, sd = sigma_tau)
+    if (prop_tau_chinese > 0) break
+  }
+  
+  repeat {
+    prop_tau_indian <- rnorm(1, mean = prev_tau_indian, sd = sigma_tau)
+    if (prop_tau_indian > 0) break
+  }
+  
+  logpost_prop_4 <- log_posterior_hier(
+      beta0        = new_beta0,
+      beta_notable = new_beta_notable,
+      beta_malay_r   = new_beta_malay_r,
+      beta_indian_r  = new_beta_indian_r,
+      beta_chinese_r = new_beta_chinese_r,
+      mu_malay     = new_mu_malay,
+      mu_indian    = new_mu_indian,
+      mu_chinese   = new_mu_chinese,
+      election_data    = election_data,
+      prior_sd_beta0   = prior_sd_beta0,
+      prior_sd_notable = prior_sd_notable,
+      scale            = scale,
+      tau_malay        = prop_tau_malay,
+      tau_chinese      = prop_tau_chinese,
+      tau_indian       = prop_tau_indian,
+      prior_sd_mu      = prior_sd_mu
+  )
+  
+  log_r4 <- logpost_prop_4 - logpost_curr
+  if (log(runif(1)) < log_r4) {
+    chain[t, "tau_malay"]   <- prop_tau_malay
+    chain[t, "tau_indian"]  <- prop_tau_indian
+    chain[t, "tau_chinese"] <- prop_tau_chinese
+    logpost_curr           <- logpost_prop_4
+    move_tau[t]             <- TRUE
+  } else {
+    chain[t, c("tau_malay", "tau_indian", "tau_chinese")] <- prev_tau
+    move_tau[t] <- FALSE
+  }
+}
+
+```
+
+## 5. Inspect Acceptance Rate and Discard Burn-in
+
+```{r}
+# Discard burn-in
+post <- as.data.frame(chain[(burn_in + 1):n_iter, ])
+post$iter <- seq(burn_in + 1, n_iter)
+
+# Acceptance rates
+acc_beta0 <- mean(move_beta0[(burn_in + 1):n_iter])
+acc_mu    <- mean(move_mu[(burn_in + 1):n_iter])
+
+cat("Acceptance rate for beta0 and beta_notable:", round(acc_beta0, 3), "\n")
+cat("Acceptance rate for mu_malay, mu_indian, mu_chinese:", round(acc_mu, 3), "\n")
+
+for (r in 1:R) {
+  acc_malay_r   <- mean(move_region[(burn_in + 1):n_iter, 1, r])
+  acc_indian_r  <- mean(move_region[(burn_in + 1):n_iter, 2, r])
+  acc_chinese_r <- mean(move_region[(burn_in + 1):n_iter, 3, r])
+  cat(sprintf("Region %d — beta_malay: %.3f, beta_indian: %.3f, beta_chinese: %.3f\n", r, acc_malay_r, acc_indian_r, acc_chinese_r))
+}
+
+acc_tau <- mean(move_tau[(burn_in + 1):n_iter])
+cat("Acceptance rate for tau_ethnic:", round(acc_tau, 3), "\n")
+
+head(post, 10)
+tail(post, 10)
+
+```
+
+## 6. Trace Plots, Posterior Densities and ACFs
+
+```{r}
+# ACF data for ggplot
+compute_acf_df <- function(x, L = 30) {
+  acf_res <- acf(x, plot = FALSE, lag.max = L)
+  data.frame(lag = acf_res$lag[-1], acf = acf_res$acf[-1])
+}
+
+# Make trace, density, and acf plot
+plot_trace_dens_acf <- function(df, varname) {
+  trace <- ggplot(df, aes_string(x = "iter", y = varname)) +
+    geom_line(color = "steelblue", alpha = 0.8) +
+    labs(title = paste("Trace plot:", varname), x = "Iteration", y = varname) +
+    theme_minimal(base_size = 14)
+  
+  dens <- ggplot(df, aes_string(x = varname)) +
+    geom_density(fill = "grey80", color = "black") +
+    labs(title = paste("Posterior density:", varname), x = varname, y = "Density") +
+    theme_minimal(base_size = 14)
+  
+  acf_df <- compute_acf_df(df[[varname]], L = 30)
+  acf_plot <- ggplot(acf_df, aes(x = lag, y = acf)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_hline(yintercept = 0) +
+    labs(title = paste("ACF:", varname), x = "Lag", y = "ACF") +
+    theme_minimal(base_size = 14)
+  
+  return(list(trace, dens, acf_plot))
+}
+
+# Start Plotting
+for (var in c("beta0", "beta_notable")) {
+  plots <- plot_trace_dens_acf(post, var)
+  grid.arrange(grobs = plots, ncol = 3)
+}
+
+for (var in c("mu_malay", "mu_indian", "mu_chinese")) {
+  plots <- plot_trace_dens_acf(post, var)
+  grid.arrange(grobs = plots, ncol = 3)
+}
+
+for (var in c("tau_malay", "tau_indian", "tau_chinese")) {
+  plots <- plot_trace_dens_acf(post, var)
+  grid.arrange(grobs = plots, ncol = 3)
+}
+
+for (r in 1:R) {
+  for (eth in c("malay", "indian", "chinese")) {
+    var <- paste0("beta_", eth, "_r", r)
+    plots <- plot_trace_dens_acf(post, var)
+    grid.arrange(grobs = plots, ncol = 3)
+  }
+}
+
+```
+
+## 7. Posterior Summaries (Mean, SD, 95% Intervals)
+
+```{r}
+posterior_summary <- post %>%
+  summarise(
+    mean_beta0        = mean(beta0),
+    sd_beta0          = sd(beta0),
+    `2.5%_beta0`      = quantile(beta0, 0.025),
+    `97.5%_beta0`     = quantile(beta0, 0.975),
+    
+    mean_beta_notable = mean(beta_notable),
+    sd_beta_notable   = sd(beta_notable),
+    `2.5%_beta_notable` = quantile(beta_notable, 0.025),
+    `97.5%_beta_notable` = quantile(beta_notable, 0.975),
+    
+    mean_mu_malay   = mean(mu_malay),
+    sd_mu_malay     = sd(mu_malay),
+    `2.5%_mu_malay` = quantile(mu_malay, 0.025),
+    `97.5%_mu_malay`= quantile(mu_malay, 0.975),
+    
+    mean_mu_indian   = mean(mu_indian),
+    sd_mu_indian     = sd(mu_indian),
+    `2.5%_mu_indian` = quantile(mu_indian, 0.025),
+    `97.5%_mu_indian`= quantile(mu_indian, 0.975),
+    
+    mean_mu_chinese   = mean(mu_chinese),
+    sd_mu_chinese     = sd(mu_chinese),
+    `2.5%_mu_chinese` = quantile(mu_chinese, 0.025),
+    `97.5%_mu_chinese`= quantile(mu_chinese, 0.975),
+    
+    across(starts_with("beta_malay_r"),   list(mean = ~mean(.), sd = ~sd(.),
+                                               low_2.5 = ~quantile(., 0.025),
+                                               hi_97.5 = ~quantile(., 0.975))),
+    across(starts_with("beta_indian_r"),  list(mean = ~mean(.), sd = ~sd(.),
+                                               low_2.5 = ~quantile(., 0.025),
+                                               hi_97.5 = ~quantile(., 0.975))),
+    across(starts_with("beta_chinese_r"), list(mean = ~mean(.), sd = ~sd(.),
+                                               low_2.5 = ~quantile(., 0.025),
+                                               hi_97.5 = ~quantile(., 0.975))),
+    mean_malay_tau   = mean(tau_malay),
+    sd_malay_tau     = sd(tau_malay),
+    `2.5%_tau_malay` = quantile(tau_malay, 0.025),
+    `97.5%_tau_malay`= quantile(tau_malay, 0.975),
+    
+    mean_chinese_tau   = mean(tau_chinese),
+    sd_chinese_tau     = sd(tau_chinese),
+    `2.5%_tau_chinese` = quantile(tau_chinese, 0.025),
+    `97.5%_tau_chinese`= quantile(tau_chinese, 0.975),
+    
+    mean_indian_tau   = mean(tau_indian),
+    sd_indian_tau     = sd(tau_indian),
+    `2.5%_tau_indian` = quantile(tau_indian, 0.025),
+    `97.5%_tau_indian`= quantile(tau_indian, 0.975),
+  ) %>%
+  pivot_longer(cols = everything(),
+               names_to = "parameter",
+               values_to = "value")
+
+print(posterior_summary, n = 100)
+
+```

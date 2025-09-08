@@ -1,0 +1,825 @@
+---
+title: "CAS Group 24"
+format: docx
+editor: visual
+---
+
+## Preprocessing (Copied from CAS Pricing 1)
+
+```{r}
+#| warning: false
+library(readxl)
+library(dplyr)
+library(caret)
+library(pscl)
+
+dataset <- read_excel("dataset.xlsx", sheet = 1)
+
+# Change all the "chr" to factor
+dataset <- dataset %>%
+  mutate(
+    across(
+      where(is.character), function(col) {
+      factor(col, levels = unique(col))
+      }
+    )
+  )
+
+# We use createDataPartition rather than sample[] is because createDataPartition keeps the distribution of the response variable. 
+# From the example above we see approximate 5% of the response have 1 claim so the test set will also have approximate 5% of claim size of 1.
+# This train dataset will consist of 70% of the data from the full dataset
+set.seed(716)
+
+train_index <- createDataPartition(dataset$ClaimNb,p = 0.7,list = FALSE)
+
+data_train <- dataset[train_index,]
+
+data_test <- dataset[-train_index,]
+
+# Construct Dataset for counting model comparison
+count_cols <- c("Power", "CarAge", "DriverAge", "Brand", "Gas", "Region", "Density", "ClaimNb")
+
+claim_number_train_set <- data_train[,count_cols]
+claim_number_test_set <- data_test[,count_cols]
+
+claim_number_train_scaled <- claim_number_train_set
+claim_number_test_scaled <- claim_number_test_set
+
+# For these numerical variables, we change them into standardized data
+claim_number_train_scaled[,c("CarAge","DriverAge","Density")] <- scale(claim_number_train_scaled[,c("CarAge","DriverAge","Density")])
+
+claim_number_test_scaled[,c("CarAge","DriverAge","Density")] <- scale(claim_number_test_scaled[,c("CarAge","DriverAge","Density")])
+
+# We separate the modelling process into 2 part A|B:
+# The count component (A) models the number of claims (including the possibility of 0)  using a Negative Binomial distribution to allow for over dispersion.
+# The zero-inflation component (B) models the probability that an observation is a guaranteed zero not due to the count process.
+zero_nbinomial_model <- zeroinfl(ClaimNb ~. | 1 + CarAge, 
+                                 data = claim_number_train_scaled,
+                                 dist = "negbin")
+
+# Hurdle Model does similar thing as the Zero-Inflated Model but the count part models positive count only (claim number of at least 1)
+hurdle_model <- hurdle(ClaimNb ~.|., data = claim_number_train_scaled, dist = "negbin")
+
+```
+
+## 1. Step-wise Variable Selection of the Zero Inflated Model
+
+Variable selection is important as the choice of variable will ultimately affect its performance.
+
+```{r}
+#| warning: false
+library(MASS)
+library(pscl)
+
+# Since there is no prebuilt function to do the stepwise selection for zero-inflated model so I will a general one.
+stepwise_zeroinfl <- function(model, direction, use_bic) {
+  
+  # Returns model frame use to build the model
+  # Clean factor levels to prevent "factor level" errors
+  model_data <- model.frame(model)
+  model_data <- droplevels(model_data)
+  
+  # all.vars returns a vector with all the character of the variables used in the model      and we use the [[1]] to extract the first element which is the response variable         ClaimNb
+  response_var <- all.vars(formula(model))[1]
+  
+  # Create binary response for zero part
+  # model_data[[response_var]] == 0 will create a logical vector with TRUE and FALSE
+  # if claim number >0 then is TRUE, the as.numeric() will then change the TRUE to be 1    and FALSE to be 0 for the logistic regression
+  model_data$zero_response <- as.numeric(model_data[[response_var]] == 0)
+  
+  # Other variables in the model except the response = all regressors
+  available_vars <- setdiff(names(model_data), c(response_var, "zero_response"))
+  
+  # For the selection function
+  count_formula_init <- as.formula(paste(response_var, "~ 1"))
+  
+  count_scope_list = list(
+    lower = count_formula_init,
+    upper = as.formula(paste(response_var, "~", paste(available_vars, 
+                                                       collapse = " + ")))
+  )
+  
+  # Set penalty (AIC vs BIC)
+  k_val <- ifelse(use_bic == FALSE, 2, log(nrow(model_data)))
+  
+  
+  # Fit initial negative binomial model
+  count_init <- glm.nb(formula = count_formula_init, data = model_data, 
+                       na.action = na.exclude)
+  
+  # Apply stepwise selection to count part
+  count_optimized <- stepAIC(count_init, 
+                            direction = direction,
+                            scope = count_scope_list,
+                            k = k_val, 
+                            trace = TRUE)
+
+  # All variables from the count_optimized excluding response is the selected variables
+  count_final_vars <- all.vars(formula(count_optimized))[-1]
+  
+  
+  zero_scope_list = list(
+    lower = as.formula("zero_response ~ 1"),
+    upper = as.formula(paste("zero_response", "~", paste(available_vars, 
+                                                       collapse = " + ")))
+  )
+  
+  # Fit initial logistic model
+  zero_init <- glm(zero_response ~ 1, 
+                   data = model_data, 
+                   family = binomial, 
+                   na.action = na.exclude)
+  
+  zero_optimized <- stepAIC(zero_init, 
+                           direction = direction, 
+                           scope = zero_scope_list,
+                           k = k_val, 
+                           trace = TRUE)
+  
+  zero_final_vars <- all.vars(formula(zero_optimized))[-1]
+  
+  
+  # Combine and fit final Zero-Inflated model
+  cat("\n Final Fitting \n")
+  
+  # Build final formula
+  count_part <- ifelse(length(count_final_vars) > 0, 
+                      paste(count_final_vars, collapse = " + "), 
+                      "1")
+  
+  zero_part <- ifelse(length(zero_final_vars) > 0, 
+                     paste(zero_final_vars, collapse = " + "), 
+                     "1")
+  
+  final_formula_str <- paste(response_var, "~", count_part, "|", zero_part)
+  
+  final_formula <- as.formula(final_formula_str)
+  
+  cat("Final formula:", final_formula_str, "\n")
+  
+  # Fit final zero-inflated model
+  final_model <- zeroinfl(formula = final_formula, 
+                         data = model_data, 
+                         dist = "negbin",
+                         control = zeroinfl.control(method = "BFGS", maxit = 1000))
+  
+  return(final_model)
+}
+
+# Model Comparison General Function
+compare_models <- function(original_model, optimized_model) {
+
+  cat("Original AIC:", AIC(original_model), "\n")
+  cat("Optimized AIC:", AIC(optimized_model), "\n")
+  cat("AIC improvement:", AIC(original_model) - AIC(optimized_model), "\n\n")
+  
+  cat("Original BIC:", BIC(original_model), "\n")
+  cat("Optimized BIC:", BIC(optimized_model), "\n")
+  cat("BIC improvement:", BIC(original_model) - BIC(optimized_model), "\n\n")
+}
+
+```
+
+```{r}
+stepwise_zeroinfNb <- stepwise_zeroinfl(zero_nbinomial_model, 
+                                    direction = "both", 
+                                    use_bic = FALSE)
+
+summary(stepwise_zeroinfNb)
+
+compare_models(zero_nbinomial_model, stepwise_zeroinfNb)
+
+```
+
+The model above shows a highly collinearity issue present in the model which is detected by by some of test from mctest().
+
+```{r}
+#| warning: false
+library(mctest)
+
+mctest(zero_nbinomial_model)
+
+```
+
+## 2. Step-wise Variable Selection for Hurdle Model
+
+```{r}
+#| warning: false
+library(MASS)
+library(pscl)
+
+stepwise_hurdle <- function(model, direction, use_bic) {
+  model_data <- model.frame(model)
+  model_data <- droplevels(model_data)
+  response_var <- all.vars(formula(model))[1]
+  
+  # For hurdle model: binary response is whether response > 0
+  # This is the key difference from zero-inflated models
+  model_data$hurdle_response <- as.numeric(model_data[[response_var]] > 0)
+  
+  available_vars <- setdiff(names(model_data), c(response_var, "hurdle_response"))
+  
+  k_val <- ifelse(use_bic == FALSE, 2, log(nrow(model_data)))
+  
+  # The Hurdle Part 0 vs >0
+  hurdle_scope_list = list(
+    lower = as.formula("hurdle_response ~ 1"),
+    upper = as.formula(paste("hurdle_response", "~", paste(available_vars, 
+                                                           collapse = " + ")))
+  )
+  
+  # Fit initial logistic model for hurdle part
+  # Fit initial logistic model with better control parameters
+   hurdle_init <- glm(hurdle_response ~ 1, 
+                     data = model_data, 
+                     family = binomial(link = "logit"),
+                     control = glm.control(maxit = 1000, epsilon = 1e-8))
+  
+  # Perform stepwise selection with error handling
+  # Try Catch will run the second expression if the first expression shows error
+  hurdle_optimized <- tryCatch({
+    stepAIC(hurdle_init, 
+            direction = direction, 
+            scope = hurdle_scope_list,
+            k = k_val, 
+            trace = TRUE,
+            steps = 1000)
+  }, error = function(e) {
+    cat("Error in hurdle stepwise selection:", e$message, "\n")
+    return(hurdle_init)
+  })
+  
+  hurdle_final_vars <- all.vars(formula(hurdle_optimized))[-1]
+  
+  # As for the Count Part we have to filter data to include only positive values
+  # Only positive observation is used
+  positive_data <- model_data[model_data[[response_var]] > 0, ]
+  
+  count_formula_init <- as.formula(paste(response_var, "~ 1"))
+  count_scope_list = list(
+    lower = count_formula_init,
+    upper = as.formula(paste(response_var, "~", paste(available_vars, 
+                                                       collapse = " + ")))
+  )
+  
+  # Initial Count Model
+  count_init <- tryCatch({
+    glm.nb(formula = count_formula_init, 
+           data = positive_data,
+           control = glm.control(maxit = 1000, epsilon = 1e-8),
+           init.theta = 1,
+           link = log)
+  }, error = function(e) {
+    cat("Error fitting initial count model, trying Poisson:", e$message, "\n")
+    glm(formula = count_formula_init, 
+        data = positive_data, 
+        family = poisson,
+        control = glm.control(maxit = 1000))
+  })
+  
+  # Perform stepwise selection for count part if error then return the initial model
+  count_optimized <- tryCatch({
+    stepAIC(count_init, 
+            direction = direction,
+            scope = count_scope_list,
+            k = k_val, 
+            trace = TRUE,
+            steps = 1000)
+  }, error = function(e) {
+    cat("Error in count stepwise selection:", e$message, "\n")
+    return(count_init)
+  })
+  
+  count_final_vars <- all.vars(formula(count_optimized))[-1]
+
+  
+  # Build final formula
+  hurdle_part <- ifelse(length(hurdle_final_vars) > 0, 
+                       paste(hurdle_final_vars, collapse = " + "), 
+                       "1")
+  
+  count_part <- ifelse(length(count_final_vars) > 0, 
+                      paste(count_final_vars, collapse = " + "), 
+                      "1")
+  
+  final_formula_str <- paste(response_var, "~", count_part, "|", hurdle_part)
+  
+  final_formula <- as.formula(final_formula_str)
+  
+  cat("Final hurdle formula:", final_formula_str, "\n")
+  
+  # Fit final hurdle model
+  final_model <- tryCatch({
+    hurdle(formula = final_formula, 
+           data = model_data, 
+           dist = "negbin",
+           zero.dist = "binomial",
+           control = hurdle.control(method = "BFGS", 
+                                   maxit = 1000, 
+                                   reltol = 1e-12,
+                                   start = NULL))
+  }, error = function(e) {
+    cat("Error fitting hurdle model with negbin, trying poisson:", e$message, "\n")
+    hurdle(formula = final_formula, 
+           data = model_data, 
+           dist = "poisson",
+           zero.dist = "binomial",
+           control = hurdle.control(method = "BFGS", maxit = 1000))
+  })
+  
+  return(final_model)
+}
+
+# Model Comparison function for hurdle models
+compare_hurdle_models <- function(original_model, optimized_model) {
+  cat("=== Hurdle Model Comparison ===\n")
+  cat("Original AIC:", round(AIC(original_model), 2), "\n")
+  cat("Optimized AIC:", round(AIC(optimized_model), 2), "\n")
+  cat("AIC improvement:", round(AIC(original_model) - AIC(optimized_model), 2), "\n\n")
+  
+  cat("Original BIC:", round(BIC(original_model), 2), "\n")
+  cat("Optimized BIC:", round(BIC(optimized_model), 2), "\n")
+  cat("BIC improvement:", round(BIC(original_model) - BIC(optimized_model), 2), "\n\n")
+}
+
+```
+
+```{r}
+#| warning: false
+stepwise_hurdle_model <- stepwise_hurdle(hurdle_model, 
+                                          direction = "both", 
+                                          use_bic = FALSE)
+
+summary(stepwise_hurdle_model)
+
+compare_models(hurdle_model,stepwise_hurdle_model)
+
+```
+
+## 3. XGBoost Model
+
+### 1. Data Preprocessing
+
+```{r}
+#| warning: false
+library(caret)
+library(dplyr)
+
+set.seed(719)
+
+train_xgindex <- createDataPartition(dataset$ClaimNb,p = 0.7,list = FALSE)
+
+data_xgtrain <- dataset[train_xgindex,]
+
+data_xgtest <- dataset[-train_xgindex,]
+
+# Drop PolicyID
+data_xgtrain <- data_xgtrain[,-1]
+
+data_xgtest <- data_xgtest[,-1]
+
+# After that we create an additional variable "Individual Claim Size"
+# Then drop the ClaimAmount
+data_xgtrain <- data_xgtrain %>%
+  mutate(
+    Individual_Claim_Size = ifelse(ClaimNb > 0,ClaimAmount/ClaimNb,0)
+  ) %>%
+  dplyr::select(-ClaimAmount)
+
+data_xgtest <- data_xgtest %>%
+  mutate(
+    Individual_Claim_Size = ifelse(ClaimNb >0, ClaimAmount/ClaimNb, 0)
+  ) %>%
+  dplyr::select(-ClaimAmount)
+
+str(data_xgtrain)
+
+str(data_xgtest)
+
+```
+
+### 2. XGboost Model Matrix Generating Function
+
+```{r}
+#| warning: false
+library(Matrix)
+
+prepare_xgb_data <- function(data, target = NULL) {
+  # One-hot encoding
+  # Exclude target variables from feature matrix
+  feature_cols <- setdiff(names(data), c("ClaimNb", "Individual_Claim_Size"))
+  
+  model_matrix <- sparse.model.matrix(~ . - 1, data = data[, feature_cols])
+  # Exclude the intercept term
+  
+  # Create DMatrix
+  # If the DMatrix is used for prediction then it will not need a target
+  if(!is.null(target)) {
+    xgb.DMatrix(data = model_matrix, label = target)
+  } else {
+    xgb.DMatrix(data = model_matrix)
+  }
+}
+
+```
+
+### 3. Frequency Model
+
+```{r}
+#| warning: false
+library(xgboost)
+
+dtrain_freq <- prepare_xgb_data(
+  data_xgtrain,
+  target = data_xgtrain$ClaimNb
+)
+
+# Train frequency model
+xgb_freq <- xgb.train(
+  params = list(
+    objective = "count:poisson",
+    eval_metric = "rmse",
+    max_depth = 6,
+    eta = 0.1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data = dtrain_freq,
+  nrounds = 2500,
+  early_stopping_rounds = 50,
+  watchlist = list(train = dtrain_freq),
+  print_every_n = 500,
+  verbose = 1
+)
+
+```
+
+#### Model Evaluation
+
+```{r}
+#| warning: false
+eval_log <- xgb_freq$evaluation_log
+tail(eval_log)
+
+library(ggplot2)
+ggplot(eval_log, aes(x = iter, y = train_rmse)) +
+  geom_line() +
+  labs(
+    title = "Training RMSE over Boosting Iterations",
+    x     = "Iteration",
+    y     = "Train RMSE"
+  ) +
+  theme_minimal()
+
+```
+
+### 4. Severity Model
+
+```{r}
+#| warning: false
+# We only take the ones with claim size > 0
+severity_train <- data_xgtrain[data_xgtrain$Individual_Claim_Size > 0, ]
+
+dtrain_sev <- prepare_xgb_data(
+    severity_train,
+    target = log(severity_train$Individual_Claim_Size)  
+    # Log-transform for skewness
+  )
+  
+  # Train severity model
+  xgb_sev <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",   # Regression for continuous target
+      eval_metric = "rmse",
+      max_depth = 6,
+      eta = 0.1,
+      subsample = 0.8,
+      colsample_bytree = 0.8
+    ),
+    data = dtrain_sev,
+    nrounds = 2500,
+    early_stopping_rounds = 50,
+    watchlist = list(train = dtrain_sev),
+    print_every_n = 500,
+    verbose = 1
+  )
+
+```
+
+#### Model Evaluation
+
+```{r}
+eval_log_sev <- xgb_sev$evaluation_log
+tail(eval_log_sev)
+
+ggplot(eval_log_sev, aes(x = iter, y = train_rmse)) +
+  geom_line() +
+  labs(
+    title = "Training RMSE over Boosting Iterations",
+    x     = "Iteration",
+    y     = "Train RMSE"
+  ) +
+  theme_minimal()
+  
+```
+
+## 4. Pure Premium Calculation
+
+```{r}
+#| warning: false
+library(readxl)
+library(dplyr)
+library(xgboost)
+# We will predict the premiums along with the test set to prevent error of incomplete variables (The dataset that we are going to apply the model have missing variables factors for example, brandFiat)
+
+data_xgpredict <- read_xlsx("dataset.xlsx", sheet = 2)
+
+names(data_xgpredict)
+
+# Add-In and remove variables so that names(data_xgpredict) = names(data_xgtest)
+data_xgpredict <- data_xgpredict %>%
+  mutate(
+    ClaimNb = 0,
+    Individual_Claim_Size = 0
+  ) %>%
+  dplyr::select(-PolicyID)
+
+
+data_xgtest <- rbind(data_xgtest,data_xgpredict)
+
+# Apply the model and Predict frequency
+# The test set is used for prediction, we do not set a target
+dtest_freq <- prepare_xgb_data(data_xgtest)
+freq_pred_test <- predict(xgb_freq, dtest_freq)
+
+
+# Predict severity on test data
+dtest_sev_all <- prepare_xgb_data(data_xgtest)
+sev_pred_test_log <- predict(xgb_sev, dtest_sev_all)
+sev_pred_test <- exp(sev_pred_test_log)  
+# Convert back to original scale since we log-transform
+
+
+# Pure Premium = Frequency × Severity
+pure_premium_test <- freq_pred_test * sev_pred_test
+
+# Add predictions to the data frame
+results_test <- data_xgtest %>%
+  mutate(
+    predicted_frequency = freq_pred_test,
+    predicted_severity = sev_pred_test,
+    predicted_pure_premium = pure_premium_test,
+    actual_pure_premium = ClaimNb * Individual_Claim_Size
+  )
+
+head(results_test)
+
+```
+
+```{r}
+#| warning: false
+library(writexl)
+
+results_write <- tail(results_test, 10000)
+
+# write_xlsx(results_write, path = "premiums_test.xlsx")
+
+```
+
+## 5. Determination of Loading Factors
+
+### 1. Calculate Parameters
+
+```{r}
+#| warning: false
+library(dplyr)
+library(fitdistrplus)  
+# For distribution fitting
+library(MASS)          
+# For additional distributions
+
+  # Frequency
+  freq_data <- dataset$ClaimNb 
+  # Fit Poisson using MLE
+  pois_fit <- fitdist(freq_data, "pois", method = "mle")
+  freq_distribution <- "poisson"
+  rate_lambda <- pois_fit$estimate[1]  # lambda parameter
+    
+  cat("Poisson Parameters (MLE):\n")
+  cat("- lambda:", round(rate_lambda, 4), "\n")
+  cat("- AIC:", round(pois_fit$aic, 2), "\n")
+  cat("- Log-likelihood:", round(pois_fit$loglik, 2), "\n")
+
+  # Severity
+  # Get positive claims only
+  severity_data <- dataset %>%
+    filter(ClaimNb > 0) %>%
+    mutate(Individual_Claim_Size = ClaimAmount / ClaimNb) %>%
+    pull(Individual_Claim_Size)
+  
+  # Fit log normal distribution using MLE
+  lnorm_fit <- fitdist(severity_data, "lnorm", method = "mle")
+  lnorm_params <- list(meanlog = lnorm_fit$estimate[1], sdlog =
+                         lnorm_fit$estimate[2])
+  
+  cat("Lognormal Parameters (MLE):\n")
+  cat("- meanlog:", round(lnorm_params$meanlog, 4), "\n")
+  cat("- sdlog:", round(lnorm_params$sdlog, 4), "\n")
+  cat("- AIC:", round(lnorm_fit$aic, 2), "\n")
+  cat("- Log-likelihood:", round(lnorm_fit$loglik, 2), "\n")
+
+```
+
+### 2. K-Means Clustering to Assign a Risk Tier
+
+```{r}
+#| warning: false
+library(dplyr)
+library(tibble)
+
+drivers <- results_write  %>%
+  # Drop the part we append previously
+  rename(
+    freq = predicted_frequency,
+    sev  = predicted_severity,
+    prem = predicted_pure_premium
+  ) %>%
+  dplyr::select(freq, sev, prem, Brand, Region)
+
+# One‑hot encode all categorical factors
+k_means_mm <- model.matrix(~ . - 1, data = drivers)
+
+# Scale each column to mean=0, sd=1
+k_means_mm_scaled <- scale(k_means_mm)
+
+# Run K‑Means Clustering and cluster all policies into 3 categories
+set.seed(720)
+km3 <- kmeans(k_means_mm_scaled, centers = 3, nstart = 25)
+
+# Map clusters with ordered Tier labels A/B/C
+# The km3$cluster is actually a vector with 1,2,3 for the 30000+ policies in the test set # Since the clusters 1 2 3 does not have a ordinal order so it is reasonable to use the premium as the reference, the tapply calculates the mean for each clusters
+# tapply(X, INDEX, FUN) does: 1. Splits the vector X into groups according to the factor or integer vector INDEX. 2. Applies the function FUN (here mean) to each group. 3. Returns a vector whose names are the unique values of INDEX (1,2,3) and whose values are mean(X[INDEX == i])
+# Arrange will then sort them from the lowest to highest and then assign tier factor A,B and C
+cluster_map <- tibble(
+  cluster_raw = 1:3,
+  mean_prem   = tapply(drivers$prem, km3$cluster, mean)
+) %>%
+  arrange(mean_prem) %>%
+  mutate(Tier = c("A","B","C"))
+
+# Attach Tier back to portfolio frame
+port <- results_write %>%
+  mutate(cluster_raw = km3$cluster) %>%
+  left_join(cluster_map, by = "cluster_raw") %>%
+  dplyr::select(-cluster_raw, -mean_prem)
+# now port$Tier is A/B/C based on cluster, using brand & other factors too
+
+```
+
+The cluster_map shall look like:
+
+|     | cluster_raw | mean_prem | Tier |
+|-----|-------------|-----------|------|
+| 1   | 2           | 43.14     | A    |
+| 2   | 3           | 47.99     | B    |
+| 3   | 1           | 49.87     | C    |
+
+The function left_join(df1, df2, by = "key) combines 2 data frames by keeping all the rows in df1, and adds matching columns from df2 based on a common key column.
+
+The results_test we add a column that marks each policy in the data frame and then left join the data frame cluster_map, after removing the cluster_raw and mean_prem all we left with is the Tier
+
+### 3. Risk Loading Optimization
+
+#### Simulation and Objective Function
+
+```{r}
+#| warning: false
+library(rBayesianOptimization)
+
+# Fitted distribution parameters
+lambda_hat  <- rate_lambda
+
+lnorm_params_vec <- unname(unlist(lnorm_params))
+meanlog_hat <- lnorm_params_vec[1]
+sdlog_hat   <- lnorm_params_vec[2]
+
+# Monte Carlo simulation
+run_simulation <- function(port, loadings, n_sim) {
+  lam_vec   <- lambda_hat
+  base_prem <- port$predicted_pure_premium
+  tiers      <- port$Tier
+
+  profits <- replicate(n_sim, {
+    # Poisson Claim Count
+    n_claims <- rpois(nrow(port), lam_vec)
+
+    # Log‑normal severities
+    losses <- sapply(n_claims, function(k) {
+      if (k > 0) sum(rlnorm(k, meanlog = meanlog_hat, sdlog = sdlog_hat))
+      else 0
+    })
+
+    # Underwriting profit
+    total_prem <- sum(base_prem * loadings[tiers])
+    total_loss <- sum(losses)
+    total_prem - total_loss
+  })
+
+  list(
+    ruin_prob       = mean(profits < 0),
+    expected_profit = mean(profits)
+  )
+}
+
+# Objective function
+target_ruin <- 0.005
+
+objective_function <- function(load_A, load_B, load_C) {
+  
+  loads <- c(A = load_A, B = load_B, C = load_C)
+  
+    sim <- run_simulation(port, loads, n_sim = 2000)
+        
+    ruin_excess <- max(0, sim$ruin_prob - target_ruin)
+    
+    penalty <- 10000*ruin_excess^2
+
+    score <- - penalty
+    
+    return(list(Score = score))
+}
+
+```
+
+#### Bayesian Optimization
+
+```{r}
+# Optimization setup
+set.seed(1206)
+opt_res_be <- BayesianOptimization(
+  FUN          = objective_function,
+  bounds       = list(
+                   load_A = c(1.00, 1.50),
+                   load_B = c(1.50, 2.50),
+                   load_C = c(2.00, 3.00)
+                 ),
+  init_points  = 5,
+  n_iter       = 10,
+  acq          = "ei",
+  verbose      = TRUE
+)
+
+```
+
+#### Apply the loadings
+
+```{r}
+#| warning: false
+library(dplyr)
+
+best_loads_be <- opt_res_be$Best_Par
+
+tier_map <- c(
+  A = best_loads_be[["load_A"]],
+  B = best_loads_be[["load_B"]],
+  C = best_loads_be[["load_C"]]
+)
+
+port_final_be <- port %>%
+  mutate(
+    OptimalLoading = tier_map[as.character(Tier)],
+    FinalPremium   = predicted_pure_premium * OptimalLoading
+  )
+
+print(
+  port_final_be %>%
+    group_by(Tier) %>%
+    summarize(
+      n_policies       = n(),
+      avg_loading      = round(mean(OptimalLoading), 4),
+      avg_final_prem   = round(mean(FinalPremium),   2),
+      total_final_prem = round(sum(FinalPremium),    0),
+      .groups = "drop"
+    )
+)
+
+```
+
+```{r}
+#| warning: false
+library(writexl)
+
+write_xlsx(port_final_be, path = "premiums_loaded.xlsx"
+)
+
+```
+
+#### Testing
+
+```{r}
+# Extract the values with the corresponding name
+loads <- c(A = best_loads_be[["load_A"]], B = best_loads_be[["load_B"]], C =  best_loads_be[["load_C"]])
+
+run_simulation(port,loads,5000)
+
+```
