@@ -1,0 +1,440 @@
+---
+title: "Survival Analysis"
+format: docx
+editor: visual
+---
+
+## Simulation
+
+```{r}
+library(ggplot2)
+library(gganimate)
+library(dplyr)
+
+# Parameters
+n_animals <- 1000
+n_steps   <- 300
+forest_size <- 500
+food_prob <- 0.20      # prob of food at each location
+starve_limit <- 10     # steps without food before starving
+repro_chance <- 0.6   # chance of reproducing when eating
+trans_prob <- 0.50      # transmission probability when sharing a cell
+disease_death_prob <- 0.2 # base death prob per step if infected
+prop_infected <- 0.2 # 5% of the initial populations starts with infected
+rage <- 30 # The reproduction reduction age
+
+# Initialize animals
+animals <- data.frame(
+  id = 1:n_animals,
+  age_enter = sample(1:50, n_animals, replace = TRUE),
+  speed = runif(n_animals, 1, 10),
+  strength = runif(n_animals, 0.5, 2),
+  resistance = runif(n_animals, 0, 1),
+  hunger = 0,          # time since last food
+  alive = TRUE,
+  time = 0,
+  status = 0,
+  infected = FALSE,    # disease status
+  x = sample(1:forest_size, n_animals, replace = TRUE), # Randomly Spawnpoint
+  y = sample(1:forest_size, n_animals, replace = TRUE),
+  born = 0,
+  step = 0
+)
+
+# Set age after age_enter is created
+animals$age <- animals$age_enter
+
+# Seed infection in a few animals
+animals$infected[sample(1:n_animals, n_animals*prop_infected)] <- TRUE  
+
+death_log <- data.frame(id=integer(), time=integer(), cause=character())
+next_id <- n_animals + 1
+
+# Store snapshots for animation
+snapshots <- list()
+pop_counts <- data.frame(time = integer(), alive = integer(), 
+                        infected = integer(), healthy = integer())
+
+
+for (t in 1:n_steps) {
+  animals$time[animals$alive] <- animals$time[animals$alive] + 1
+  
+  # If still alive then the age plus 1 after each loop
+  animals$age[animals$alive] <- animals$age[animals$alive] + 1
+  
+  animals$step <- animals$step + 1
+  
+  # Old age mortality
+  for (i in which(animals$alive)) {
+    if (runif(1) < 0.003 * animals$age[i]) {
+      animals$alive[i] <- FALSE
+      animals$status[i] <- 1
+      death_log <- rbind(death_log,
+                         data.frame(id=animals$id[i], time=t, cause="old_age"))
+    }
+  }
+  
+  # Generate food
+  food <- matrix(0, nrow = forest_size, ncol = forest_size)
+  food[runif(forest_size*forest_size) < food_prob] <- 1   # good food
+  food[runif(forest_size*forest_size) < 0.01] <- -1       # poisonous
+  
+  for (i in which(animals$alive)) {
+    # Random movement
+    move_x <- sample(c(-1,0,1), 1) * round(animals$speed[i])
+    move_y <- sample(c(-1,0,1), 1) * round(animals$speed[i])
+    animals$x[i] <- max(1, min(forest_size, animals$x[i] + move_x))
+    animals$y[i] <- max(1, min(forest_size, animals$y[i] + move_y))
+    
+    # Hunger increases
+    animals$hunger[i] <- animals$hunger[i] + 1
+    
+    # Food check
+    cell <- food[animals$x[i], animals$y[i]]
+    if (cell == 1) {
+      animals$hunger[i] <- 0
+      
+      # Reduced Reproduction chance if above a threshold age
+      if (animals$age[i] > 10 && animals$age[i] < 50) {
+      repro_chance_i <- ifelse(animals$age[i] < rage, repro_chance, repro_chance/3)
+      if (runif(1) < repro_chance_i) {
+        baby <- animals[i,]
+        baby$id <- next_id; next_id <- next_id + 1
+        baby$age <- 0
+        baby$age_enter <- 0
+        baby$x <- animals$x[i]
+        baby$y <- animals$y[i]
+        baby$time <- 0
+        baby$hunger <- 0
+        baby$infected <- FALSE   # babies start healthy
+        baby$alive <- TRUE
+        baby$status <- 0
+        baby$born <- t
+        animals <- rbind(animals, baby)
+      }
+    }
+    } else if (cell == -1) {
+      if (runif(1) > animals$resistance[i]) {
+        animals$alive[i] <- FALSE
+        animals$status[i] <- 1
+        death_log <- rbind(death_log, data.frame(id=animals$id[i], 
+                                                 time=t, cause="poison"))
+      }
+    }
+    
+    # Disease mortality (if infected)
+    if (animals$infected[i] && animals$alive[i]) {
+      if (runif(1) < disease_death_prob * (1 - animals$resistance[i])
+          * (1 + animals$age[i]/50)) {
+        animals$alive[i] <- FALSE
+        animals$status[i] <- 1
+        death_log <- rbind(death_log, data.frame(id=animals$id[i], 
+                                                 time=t, cause="disease"))
+      }
+    }
+  }
+  
+  # Starvation deaths
+  starved <- which(animals$alive & animals$hunger > starve_limit)
+  if (length(starved) > 0) {
+    animals$alive[starved] <- FALSE
+    animals$status[starved] <- 1
+    death_log <- rbind(death_log,
+                       data.frame(id=animals$id[starved], time=t, cause="starve"))
+  }
+  
+  # Fighting
+  living_animals <- which(animals$alive)
+  if (length(living_animals) > 1) {
+    coords <- paste(animals$x[living_animals], animals$y[living_animals])
+    coord_table <- table(coords)
+    contested_coords <- names(coord_table)[coord_table > 1]
+    
+    for (coord in contested_coords) {
+      occupants <- living_animals[coords == coord]
+      if (length(occupants) > 1) {
+        
+        # Separate adults and juveniles - adults don't fight babies
+        adults <- occupants[animals$age[occupants] >= 10]
+        juveniles <- occupants[animals$age[occupants] < 10]
+        
+        # Only adults fight each other, juveniles are ignored
+        if (length(adults) > 1) {
+          
+          # Probabilistic combat (more realistic)
+          # Stronger animals have higher chance to win but not guaranteed
+          strengths <- animals$strength[adults]
+          ages <- animals$age[adults]
+          
+          # Combat score = strength * age_factor * random_factor
+          age_factors <- pmin(2, ages / 20)  # Peak fighting at age 40
+          combat_scores <- strengths * age_factors * runif(length(adults),0.5, 1.5)
+          
+          # Winner based on combat score
+          winner_idx <- which.max(combat_scores)
+          winner <- adults[winner_idx]
+          
+          # Not all losers die - some might flee
+          potential_casualties <- setdiff(adults, winner)
+          strength_diff <- strengths[winner_idx] - strengths[-winner_idx]
+          
+          # Higher strength difference = higher casualty rate
+          casualty_prob <- pmin(0.8, pmax(0.1, 0.3 + strength_diff * 0.3))
+          casualties <- potential_casualties[
+            runif(length(potential_casualties)) < casualty_prob]
+          
+          if (length(casualties) > 0) {
+            animals$alive[casualties] <- FALSE
+            animals$status[casualties] <- 1
+            death_log <- rbind(death_log,
+                              data.frame(id=animals$id[casualties], 
+                                         time=t, cause="combat"))
+          }
+          
+        } else if (length(adults) == 1 && length(juveniles) > 1) {
+          # Single adult with multiple juveniles - carrying capacity
+          # Adult might kill some juveniles if overcrowded (>5 total)
+          if (length(occupants) > 5) {
+            excess_juveniles <- length(juveniles) - 3  # Keep max 3 juveniles
+            if (excess_juveniles > 0) {
+              # Kill weakest juveniles
+              juv_strengths <- animals$strength[juveniles]
+              casualties <- juveniles[order(juv_strengths)[1:excess_juveniles]]
+              
+              animals$alive[casualties] <- FALSE
+              animals$status[casualties] <- 1
+              death_log <- rbind(death_log,
+                                data.frame(id=animals$id[casualties], 
+                                           time=t, cause="overcrowding"))
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  # Disease spread
+  coords <- paste(animals$x, animals$y)
+  for (cell in unique(coords)) {
+    occupants <- which(coords == cell & animals$alive)
+    if (length(occupants) > 1) {
+      if (any(animals$infected[occupants])) {
+        new_infected <- occupants[!animals$infected[occupants]]
+        infected_now <- new_infected[runif(length(new_infected)) < trans_prob]
+        animals$infected[infected_now] <- TRUE
+      }
+    }
+  }
+
+  # Save snapshot
+  alive_count <- sum(animals$alive)
+  infected_count <- sum(animals$alive & animals$infected)
+  healthy_count <- alive_count - infected_count
+  
+  # Store population data
+  pop_counts <- rbind(pop_counts, data.frame(
+    time = t, 
+    alive = alive_count, 
+    infected = infected_count,
+    healthy = healthy_count
+  ))
+  
+  # Save snapshot with population info
+  current_animals <- animals %>%
+    mutate(step = t)
+  
+  snapshots[[t]] <- current_animals
+}
+
+```
+
+## Plot
+
+```{r}
+library(ggplot2)
+
+ggplot(pop_counts, aes(x=time)) +
+  geom_line(aes(y=alive, color="Total"), size=1.2) +
+  geom_line(aes(y=infected, color="Infected"), size=1.2) +
+  geom_line(aes(y=healthy, color="Healthy"), size=1.2) +
+  scale_color_manual(values=c("Total"="black", "Infected"="red", 
+                              "Healthy"="darkgreen")) +
+  theme_minimal() +
+  labs(title="Population Trajectory Over Time", 
+       x="Time Step", y="Count", color="Population") +
+  theme(legend.position = "bottom")
+
+# Final state snapshot
+ggplot(animals, aes(x=x, y=y, color=infected, shape=alive)) +
+  geom_point(size=3, alpha=0.7) +
+  scale_shape_manual(values=c(4, 16), name="Status", labels=c("Dead", "Alive")) +
+  scale_color_manual(values=c("darkgreen","red"), name="Health", 
+                     labels=c("Healthy", "Infected")) +
+  theme_minimal() +
+  labs(title=paste("Final State - Population:", sum(animals$alive)),
+       x="X Coordinate", y="Y Coordinate")
+
+```
+
+## Model
+
+![](images/clipboard-722386054.png)
+
+```{r}
+library(survival)
+library(flexsurv)
+library(dplyr)
+
+animals <- animals %>%
+  filter(time > 0)
+
+# Fit model using actual time at risk
+fit <- flexsurvreg(
+  Surv(time, status) ~ 
+    age_enter + speed + strength + resistance + infected,
+  data = animals,
+  dist = "exponential"
+)
+
+fit_cox <- coxph(
+  Surv(time, status) ~ 
+    age_enter + speed + strength + resistance + infected,
+  data = animals
+)
+
+fit
+
+fit_cox
+
+```
+
+```{r}
+# flexsurvreg
+plot(fit, type="survival", 
+     newdata=data.frame(age_enter=0, speed=1, strength=1, resistance=0.5, infected=FALSE),
+     col="blue", lwd=2, ci=FALSE)
+
+plot(fit, type="survival", 
+     newdata=data.frame(age_enter=0, speed=1, strength=1, resistance=0.5, infected=TRUE),
+     col="red", lwd=2, ci=FALSE, add=TRUE)
+
+legend("topright", legend=c("Healthy","Infected"), col=c("blue","red"), lwd=2)
+
+# coxph
+sf <- survfit(fit_cox, newdata = data.frame(
+  age_enter = 0, speed = 1, strength = 1, resistance = 0.5, 
+  infected = c(FALSE, TRUE)
+))
+
+plot(sf, col = c("blue", "red"), lwd = 2, conf.int = FALSE)
+legend("topright", legend = c("Healthy", "Infected"), col = c("blue", "red"), lwd = 2)
+
+```
+
+```{r}
+times <- 1:100
+
+surv_healthy <- summary(fit, t=times, type="survival", 
+                        newdata=data.frame(age_enter=0, speed=1, 
+                                           strength=1, resistance=0.5, 
+                                           infected=FALSE))
+
+surv_infected <- summary(fit, t=times, type="survival", 
+                         newdata=data.frame(age_enter=0, speed=1,
+                                            strength=1, resistance=0.5,
+                                            infected=TRUE))
+
+mort_table <- data.frame(
+  time = times,
+  surv_healthy = round(surv_healthy[[1]]$est,3),
+  surv_infected = round(surv_infected[[1]]$est,3)
+)
+
+print(mort_table)
+
+```
+
+## Life Table
+
+```{r}
+# P_xt: counts of animals alive by (age, time)
+# D_x: deaths by age (nearest birthday)
+# E^c_x: central exposed-to-risk by trapezium rule across time steps
+
+library(dplyr)
+library(tidyverse)
+library(scales)
+
+# 1) Build P_xt: counts alive by (age, step)
+P_xt <- bind_rows(snapshots) %>%
+  filter(!is.na(age)) %>%
+  group_by(step, age) %>%
+  summarise(P = sum(alive, na.rm = TRUE), .groups = "drop") %>%
+  arrange(step, age)
+
+time_points <- sort(unique(P_xt$step))
+
+# 2) Build D_x: deaths by age
+# Extract (id, step, age) for all individuals from snapshots
+age_lookup <- bind_rows(snapshots) %>%
+  select(id, step, age)
+
+# Join death_log with ages at time of death
+death_ages <- death_log %>%
+  rename(step = time) %>% 
+  left_join(age_lookup, by = c("id", "step")) # Append the age_lookup to death_ages
+
+# Summarise deaths by age
+D_x_df <- death_ages %>%
+  filter(!is.na(age)) %>%
+  group_by(age) %>%
+  summarise(D_x = n(), .groups = "drop")
+
+# 3) Compute exposures E^c_x via trapezium rule
+# Ensure full age grid
+ages <- seq(min(P_xt$age), max(P_xt$age), 1)
+P_full <- expand.grid(step = time_points, age = ages) %>%
+  left_join(P_xt, by = c("step", "age")) %>%
+  mutate(P = replace_na(P, 0)) %>%
+  arrange(age, step)
+
+# Trapezium sum per age
+Ecx <- P_full %>%
+  group_by(age) %>%
+  summarise(E_cx = sum((P[-length(P)] + P[-1]) / 2), .groups = "drop") %>%
+  left_join(D_x_df, by = "age") %>%
+  mutate(D_x = replace_na(D_x, 0)) %>%
+  filter(E_cx > 0)
+
+# 4) Crude estimators
+Ecx <- Ecx %>%
+  mutate(
+    mu_hat = round(D_x / E_cx,3),
+    q_hat = round(1 - exp(-mu_hat),3),
+    p_hat = round(1 - q_hat,3)
+  )
+
+# 6) Results
+res <- Ecx %>% select(age, D_x, E_cx, mu_hat, q_hat, p_hat)
+
+# Plots
+p1 <- ggplot(res, aes(x = age)) +
+  geom_point(aes(y = mu_hat), size = 1.8, alpha = 0.9) +
+  labs(title = "Crude force of mortality",
+       y = expression(mu[x]), x = "Age") +
+  scale_y_continuous(labels = scales::scientific)
+
+p2 <- ggplot(res, aes(x = age)) +
+  geom_point(aes(y = q_hat), size = 1.8, alpha = 0.9) +
+  labs(title = "Crude 1-year death probability",
+       y = expression(q[x]), x = "Age") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.01))
+
+print(p1)
+print(p2)
+
+head(res, 20)
+
+write.csv(res, "mortality_table.csv", row.names = FALSE)
+
+```
